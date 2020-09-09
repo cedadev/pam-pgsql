@@ -27,8 +27,25 @@
 #include <crypt.h>
 #include <gcrypt.h>
 
+#include <openssl/evp.h>
+
+/* Base 64 encoding / decoding */
+#include <openssl/bio.h>
+#include <openssl/buffer.h>
+
 #include "backend_pgsql.h"
 #include "pam_pgsql.h"
+
+static char* PBKDF2_HMAC_SHA_256_string(const char* passwd,
+												const unsigned char* salt,
+												int32_t n_iter,
+												uint32_t key_len);
+
+static unsigned char * hex_string2byte_array(const char *hex_string);
+static char * byte_array2hex_string(const unsigned char *byte_array);
+
+static char *base64_encode(const unsigned char *input, int length);
+static char *base64_decode(const unsigned char *input, int length);
 
 static char *
 crypt_makesalt(pw_scheme scheme);
@@ -264,12 +281,20 @@ backend_authenticate(const char *service, const char *user, const char *passwd, 
 			for (int i = 0; i < row_count && rc != PAM_SUCCESS; i++) {
 				if (!PQgetisnull(res, i, 0)) {
 					char *stored_pw = PQgetvalue(res, i, 0);
+					char *stored_salt = (char *)NULL;
+
+					// Get stored salt as second column if it exists
+					if (!PQgetisnull(res, i, 1)) {
+						stored_salt = PQgetvalue(res, i, 1);
+					}
+
 					if (options->pw_type == PW_FUNCTION) {
 						if (!strcmp(stored_pw, "t")) {
 							rc = PAM_SUCCESS;
 						}
 					} else {
-						tmp = password_encrypt(options, user, passwd, stored_pw);
+						tmp = password_encrypt(options, user, passwd, stored_pw, stored_salt);
+						SYSLOG("backend_authenticate: tmp=%s, stored_pw=%s;", tmp, stored_pw);
 						if (tmp != NULL && !strcmp(stored_pw, tmp)) {
 							rc = PAM_SUCCESS;
 						}
@@ -286,7 +311,8 @@ backend_authenticate(const char *service, const char *user, const char *passwd, 
 
 /* private: encrypt password using the preferred encryption scheme */
 char *
-password_encrypt(modopt_t *options, const char *user, const char *pass, const char *salt)
+password_encrypt(modopt_t *options, const char *user, const char *pass, const char *salt,
+				 const char *stored_salt)
 {
 	char *s = NULL;
 
@@ -354,6 +380,19 @@ password_encrypt(modopt_t *options, const char *user, const char *pass, const ch
 		break;
 		case PW_CLEAR:
 		case PW_FUNCTION:
+		case PW_PBKDF2: {
+			char *enc_passwd = (char *)NULL; 
+			unsigned char *decoded_salt = base64_decode(stored_salt, 
+														strlen(stored_salt));
+
+			enc_passwd = PBKDF2_HMAC_SHA_256_string(pass, decoded_salt, 27500, 64);
+			if (! enc_passwd) {
+				return (char *)NULL;
+			}
+			free(decoded_salt);
+			s = strdup((char *)enc_passwd);
+		}
+		break;
 		default:
 			s = strdup(pass);
 	}
@@ -384,4 +423,145 @@ crypt_makesalt(pw_scheme scheme)
 	while(pos<len)result[pos++]=i64c(random()&63);
 	result[len]=0;
 	return result;
+}
+
+static char* PBKDF2_HMAC_SHA_256_string(const char* passwd,
+										const unsigned char* salt,
+										int32_t n_iter,
+										uint32_t key_len)
+{
+    char func_name[] = "PBKDF2_HMAC_SHA_256_string";
+	char *b64_result = (char *)NULL;
+	unsigned char *digest = (unsigned char *)calloc(key_len, 
+													sizeof(unsigned char));
+	if (! digest) {
+		SYSLOG("%s: error allocating memory for digest buffer.", func_name);
+		return (char *)NULL;
+	}
+
+    if (! PKCS5_PBKDF2_HMAC(passwd, strlen(passwd), 
+	                        salt, strlen(salt),
+                      		n_iter, EVP_sha256(), key_len, digest)) {
+		SYSLOG("%s: error applying PBKDF2 hashing for input password", 
+			   func_name);
+		return (char *)NULL;
+	}
+
+	//hex_digest = byte_array2hex_string(digest);
+    //return hex_digest;
+	b64_result = base64_encode(digest, strlen(digest));
+	free(digest);
+
+    return b64_result;
+}
+
+
+static unsigned char * hex_string2byte_array(const char *hex_string) {
+    const char func_name[] = "hex_string2byte_array";
+    const int byte_array_size = strlen(hex_string)/2;
+    const char *ptr = hex_string;
+    size_t count = 0;
+    unsigned char *byte_array = (unsigned char *)malloc(
+                                        byte_array_size*sizeof(unsigned char));
+    if (byte_array == (unsigned char *)NULL) {
+        SYSLOG("%s: error allocating memory for output buffer", func_name);
+        return (unsigned char *)NULL;
+    }
+
+    for (count = 0; count < byte_array_size; count++) {
+		if (*ptr == '\\' || *ptr == 'x') {
+			// Skip \x leading chars returned for Postgres hex string
+			ptr++;
+		} else {
+			sscanf(ptr, "%2hhx", &byte_array[count]);
+			ptr += 2 * sizeof(unsigned char);
+		} 
+    } 
+
+    return byte_array;
+}
+
+static char * byte_array2hex_string(const unsigned char *byte_array){
+    const char func_name[] = "byte_array2hex_string";
+	const int byte_array_size = sizeof(byte_array)/sizeof(byte_array[0]);
+    const int hex_string_size = byte_array_size*2;
+    const unsigned char *ptr = byte_array;
+    size_t count = 0;
+    char *hex_string = (char *)malloc(hex_string_size*sizeof(char));
+    if (hex_string == (char *)NULL) {
+        SYSLOG("%s: error allocating memory for output buffer", func_name);
+        return (char *)NULL;
+    }
+
+    for (count = 0; count < byte_array_size; count++) {
+		sprintf(&hex_string[count * 2], "%.2x", *ptr);
+		ptr++;
+	}
+
+    return hex_string;
+}
+
+
+// Thanks to:
+// http://www.ioncannon.net/programming/34/howto-base64-encode-with-cc-and-openssl/
+static char *base64_encode(const unsigned char *input, int length) {
+	char func_name[] = "base64_encode";
+    BIO *bmem = (BIO *)NULL;
+	BIO *b64 = (BIO *)NULL;
+    BUF_MEM *bptr = (BUF_MEM *)NULL;
+    int i = 0;
+    char *p_buff_out = (char *)NULL;
+	char *buff_out = (char *)NULL;
+
+    b64 = BIO_new(BIO_f_base64());
+    bmem = BIO_new(BIO_s_mem());
+    b64 = BIO_push(b64, bmem);
+    BIO_write(b64, input, length);
+    BIO_flush(b64);
+    BIO_get_mem_ptr(b64, &bptr);
+
+	buff_out = (char *)calloc(bptr->length, sizeof(char));
+    if (! buff_out) {
+        SYSLOG("%s: error allocating memory for output buffer", func_name);
+        return (char *)NULL;
+    }
+
+	for (p_buff_out=buff_out, i=0; i < bptr->length; i++) {
+        if (bptr->data[i] != '\n') {
+            *p_buff_out = bptr->data[i];
+            p_buff_out++;
+        }
+    }
+    buff_out[bptr->length-1] = 0;
+ 
+    BIO_free_all(b64);
+ 
+    return buff_out;
+}
+
+
+// Thanks to:
+// http://www.ioncannon.net/programming/122/howto-base64-decode-with-cc-and-openssl/
+static char *base64_decode(const unsigned char *input, int length)
+{
+    const char func_name[] = "base64_decode";
+	BIO *b64, *bmem;
+    char *buff_out = (char *)malloc(length*sizeof(char));
+    if (! buff_out) {
+        SYSLOG("%s: error allocating memory for output buffer", func_name);
+        return (char *)NULL;
+    }
+ 
+	memset(buff_out, 0, length);
+
+    b64 = BIO_new(BIO_f_base64());
+    BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
+    bmem = BIO_new_mem_buf(input, length);
+    bmem = BIO_push(b64, bmem);
+
+    BIO_read(bmem, buff_out, length);
+
+    BIO_free_all(bmem);
+ 
+    return buff_out;
 }
