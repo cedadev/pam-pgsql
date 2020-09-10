@@ -279,10 +279,30 @@ backend_authenticate(const char *service, const char *user, const char *passwd, 
 				if (!PQgetisnull(res, i, 0)) {
 					char *stored_pw = PQgetvalue(res, i, 0);
 					char *stored_salt = (char *)NULL;
+					int n_iter = 0;
 
-					// Get stored salt as second column if it exists
-					if (!PQgetisnull(res, i, 1)) {
-						stored_salt = PQgetvalue(res, i, 1);
+					if (options->pw_type == PW_PBKDF2) {
+						// Get stored salt as second column if it exists
+						if (!PQgetisnull(res, i, 1)) {
+							stored_salt = PQgetvalue(res, i, 1);
+						} else {
+							SYSLOG(
+								"Expecting salt value returned in second column from database auth query for PBKDF2 password type.");
+							return rc;
+						}
+
+						// Get number of iterations if set - either from db
+						// query or universal setting in config file
+						if (!PQgetisnull(res, i, 2)) {
+							n_iter = atoi(PQgetvalue(res, i, 2));
+						} else if (options->pbkdf2_n_iter != -1) {
+							n_iter = options->pbkdf2_n_iter;
+						} else {
+							SYSLOG(
+								"Expecting hash number of iterations to be set as third column in database auth query or as 'pbkdf2_n_iter' setting in %s", 
+								PAM_PGSQL_FILECONF);
+							return rc;
+						}
 					}
 
 					if (options->pw_type == PW_FUNCTION) {
@@ -290,8 +310,7 @@ backend_authenticate(const char *service, const char *user, const char *passwd, 
 							rc = PAM_SUCCESS;
 						}
 					} else {
-						tmp = password_encrypt(options, user, passwd, stored_pw, stored_salt);
-						SYSLOG("backend_authenticate: tmp=%s, stored_pw=%s;", tmp, stored_pw);
+						tmp = password_encrypt(options, user, passwd, stored_pw, stored_salt, n_iter);
 						if (tmp != NULL && !strcmp(stored_pw, tmp)) {
 							rc = PAM_SUCCESS;
 						}
@@ -309,7 +328,7 @@ backend_authenticate(const char *service, const char *user, const char *passwd, 
 /* private: encrypt password using the preferred encryption scheme */
 char *
 password_encrypt(modopt_t *options, const char *user, const char *pass, const char *salt,
-				 const char *stored_salt)
+				 const char *stored_salt, const int n_iter)
 {
 	char *s = NULL;
 
@@ -381,7 +400,7 @@ password_encrypt(modopt_t *options, const char *user, const char *pass, const ch
 			char *encoded_passwd = (char *)NULL; 
 		    unsigned char *decoded_salt = base64_decode(stored_salt, strlen(stored_salt));
 
-			encoded_passwd = calc_PBKDF2_HMAC_SHA256(pass, decoded_salt, 27500, 64);
+			encoded_passwd = calc_PBKDF2_HMAC_SHA256(pass, decoded_salt, n_iter, 64);
 			if (! encoded_passwd) {
 				return (char *)NULL;
 			}

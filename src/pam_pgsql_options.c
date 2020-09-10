@@ -120,6 +120,8 @@ read_config_file(modopt_t *options) {
             }
         } else if(!strcmp(buffer, "debug")) {
             options->debug = 1;
+        } else if(!strcmp(buffer, "pbkdf2_n_iter")) {
+            options->pbkdf2_n_iter = atoi(val);
         }
 
     }
@@ -177,6 +179,7 @@ modopt_t * mod_options(int argc, const char **argv) {
     modopt->port = strdup("5432");
     modopt->debug = 0;
     modopt->std_flags = 0;
+    modopt->pbkdf2_n_iter = -1;
 
     for(i=0; i<argc; i++) {
 

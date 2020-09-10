@@ -57,6 +57,7 @@ typedef struct modopt_s {
 	int pw_type;
    int debug;
 	int std_flags;
+   int pbkdf2_n_iter;
 
 } modopt_t;
 
