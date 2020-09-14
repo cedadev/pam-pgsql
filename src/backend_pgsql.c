@@ -398,13 +398,19 @@ password_encrypt(modopt_t *options, const char *user, const char *pass, const ch
 		case PW_FUNCTION:
 		case PW_PBKDF2: {
 			char *encoded_passwd = (char *)NULL; 
-		    unsigned char *decoded_salt = base64_decode(stored_salt, strlen(stored_salt));
+			unsigned char *decoded_salt = base64_decode(salt, strlen(salt));
+			uint32_t req_key_len = strlen((char *)decoded_salt);
+		    unsigned char *decoded_stored_salt = base64_decode(stored_salt, 
+															strlen(stored_salt));
 
-			encoded_passwd = calc_PBKDF2_HMAC_SHA256(pass, decoded_salt, n_iter, 64);
+			// Key length corresponds to the salt (hashed password) obtained from
+			// the db
+			encoded_passwd = calc_PBKDF2_HMAC_SHA256(pass, decoded_stored_salt, 
+													 n_iter, req_key_len);
 			if (! encoded_passwd) {
 				return (char *)NULL;
 			}
-			free(decoded_salt);
+			free(decoded_stored_salt);
 			s = strdup((char *)encoded_passwd);
 		}
 		break;
@@ -459,14 +465,13 @@ static char* calc_PBKDF2_HMAC_SHA256(const char* passwd,
 		return (char *)NULL;
 	}
 
-    if (! PKCS5_PBKDF2_HMAC(passwd, strlen(passwd), 
-	                        salt, strlen((char *)salt),
+    if (! PKCS5_PBKDF2_HMAC(passwd, -1, salt, strlen((char *)salt),
                       		n_iter, EVP_sha256(), key_len, digest)) {
 		SYSLOG("%s: error applying PBKDF2 hashing for input password", 
 			   func_name);
 		return (char *)NULL;
 	}
-
+	
 	b64_result = base64_encode(digest, strlen((char *)digest));
 	free(digest);
 
