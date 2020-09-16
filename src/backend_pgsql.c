@@ -402,7 +402,8 @@ password_encrypt(modopt_t *options, const char *user, const char *pass, const ch
 			uint32_t req_key_len = strlen((char *)decoded_salt);
 		    unsigned char *decoded_stored_salt = base64_decode(stored_salt, 
 															strlen(stored_salt));
-
+			free(decoded_salt);
+			
 			// Key length corresponds to the salt (hashed password) obtained from
 			// the db
 			encoded_passwd = calc_PBKDF2_HMAC_SHA256(pass, decoded_stored_salt, 
